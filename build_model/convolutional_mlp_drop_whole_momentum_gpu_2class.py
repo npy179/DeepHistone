@@ -9,17 +9,19 @@ import theano.tensor as T
 from theano.tensor.signal import downsample
 from theano.tensor.nnet import conv
 
-from logistic_sgd import LogisticRegression
-from mlp import HiddenLayer, ReLu
+from logistic_sgd_drop import LogisticRegression
+from mlp_drop import HiddenLayer, ReLu, dropout
+import cPickle
+
 
 def load_data(sequences, labels):
     print "loading data.............."
     sequence = np.load(sequences)#make sure the data type is float 32
     label = np.load(labels)
 
-    num_train = 720000
-    num_valid = 360000
-    num_test = 360881
+    num_train = 5000
+    num_valid = 2500
+    num_test = 2500
 
     train_sequence = sequence[0:num_train,]
     train_label = label[0:num_train]
@@ -33,10 +35,10 @@ def load_data(sequences, labels):
     test_label = label[num_train+num_valid+1:]
     test_set = (test_sequence, test_label)
 
-    def shared_dataset(data_xy, borrow=True):
+    def shared_dataset(data_xy):
         data_x, data_y = data_xy
-        shared_x = theano.shared(numpy.asarray(data_x, dtype=theano.config.floatX))
-        shared_y = theano.shared(numpy.asarray(data_y, dtype=theano.config.floatX))
+        shared_x = T._shared(numpy.asarray(data_x, dtype=theano.config.floatX),borrow=True)
+        shared_y = theano.shared(numpy.asarray(data_y, dtype=theano.config.floatX),borrow=True)
 
         return shared_x, T.cast(shared_y, 'int32')
 
@@ -51,7 +53,7 @@ def load_data(sequences, labels):
 class LeNetConvPoolLayer(object):
     """Pool Layer of a convolutional network """
 
-    def __init__(self, rng, input, filter_shape, image_shape, poolsize):
+    def __init__(self, rng, input, filter_shape, image_shape, poolsize, dropout_rate):
         """
         Allocate a LeNetConvPoolLayer with shared variable internal parameters.
 
@@ -117,7 +119,7 @@ class LeNetConvPoolLayer(object):
         # reshape it to a tensor of shape (1, n_filters, 1, 1). Each bias will
         # thus be broadcasted across mini-batches and feature map
         # width & height
-        self.output = ReLu(pooled_out + self.b.dimshuffle('x', 0, 'x', 'x'))
+        self.output = dropout(rng=rng, input=ReLu(pooled_out + self.b.dimshuffle('x', 0, 'x', 'x')), p_rate = dropout_rate)
 
         # store parameters of this layer
         self.params = [self.W, self.b]
@@ -126,9 +128,9 @@ class LeNetConvPoolLayer(object):
         self.input = input
 
 
-def evaluate_lenet5(learning_rate=0.13, n_epochs=200,
-                    sequence="sequence_shuffle_float32.npy", labels="label_shuffle_int64.npy",
-                    nkerns=[320, 480, 960], batch_size=1000):
+def evaluate_lenet5(learning_rate=0.03, n_epochs=50,
+                    sequence="seq_10000.npy", labels="label_10000.npy",
+                    nkerns=[320, 480, 960], batch_size=100):
     """ Demonstrates lenet on MNIST dataset
 
     :type learning_rate: float
@@ -177,44 +179,35 @@ def evaluate_lenet5(learning_rate=0.13, n_epochs=200,
     # Reshape matrix of rasterized images of shape (batch_size, 28 * 28)
     # to a 4D tensor, compatible with our LeNetConvPoolLayer
     # (28, 28) is the size of MNIST images.
-    layer0_input = x.reshape((batch_size, 1, 600, 4))
+    layer0_input = dropout(rng, x.reshape((batch_size, 1, 4, 600)), p_rate=0.5)
 
     # Construct the first convolutional pooling layer:
-    # filtering reduces the image size to (28-5+1 , 28-5+1) = (24, 24)
-    # maxpooling reduces this further to (24/2, 24/2) = (12, 12)
-    # 4D output tensor is thus of shape (batch_size, nkerns[0], 12, 12)
     layer0 = LeNetConvPoolLayer(
         rng,
         input=layer0_input,
-        image_shape=(batch_size, 1, 600, 4),
-        filter_shape=(nkerns[0], 1, 19, 4),
-        poolsize=(3, 1)
+        image_shape=(batch_size, 1, 4, 600),
+        filter_shape=(nkerns[0], 1, 4, 19),
+        poolsize=(1, 3),
+        dropout_rate = 0.5
     )
 
     layer1 = LeNetConvPoolLayer(
         rng,
         input=layer0.output,
-        image_shape=(batch_size, nkerns[0], 194, 1),
-        filter_shape=(nkerns[1], nkerns[0], 11, 1),
-        poolsize=(4, 1)
+        image_shape=(batch_size, nkerns[0], 1, 194),
+        filter_shape=(nkerns[1], nkerns[0], 1, 11),
+        poolsize=(1, 4),
+        dropout_rate = 0.5
     )
 
     layer2 = LeNetConvPoolLayer(
         rng,
         input=layer1.output,
-        image_shape=(batch_size, nkerns[1], 46, 1),
-        filter_shape=(nkerns[2], nkerns[1], 7, 1),
-        poolsize=(4,1)
+        image_shape=(batch_size, nkerns[1], 1, 46),
+        filter_shape=(nkerns[2], nkerns[1], 1, 7),
+        poolsize=(1,4),
+        dropout_rate = 0.5
     )
-    # Construct the second convolutional pooling layer
-    # filtering reduces the image size to (12-5+1, 12-5+1) = (8, 8)
-    # maxpooling reduces this further to (8/2, 8/2) = (4, 4)
-    # 4D output tensor is thus of shape (batch_size, nkerns[1], 4, 4)
-
-    # the HiddenLayer being fully-connected, it operates on 2D matrices of
-    # shape (batch_size, num_pixels) (i.e matrix of rasterized images).
-    # This will generate a matrix of shape (batch_size, nkerns[1] * 4 * 4),
-    # or (500, 50 * 4 * 4) = (500, 800) with the default values.
     layer3_input = layer2.output.flatten(2)
 
     # construct a fully-connected sigmoidal layer
@@ -223,13 +216,22 @@ def evaluate_lenet5(learning_rate=0.13, n_epochs=200,
         input=layer3_input,
         n_in=nkerns[2] * 10 * 1,
         n_out=1000,
+        dropout_rate = 0.5
     )
 
     # classify the values of the fully-connected sigmoidal layer
-    layer4 = LogisticRegression(input=layer3.output, n_in=1000, n_out=5)
+    layer4 = LogisticRegression(input=layer3.output, n_in=1000, n_out=2, dropout_rate=0.5)
 
     # the cost we minimize during training is the NLL of the model
-    cost = layer4.negative_log_likelihood(y)
+
+    L1 = abs(layer0.W).sum()+abs(layer1.W).sum()+abs(layer2.W).sum()+abs(layer3.W).sum()+abs(layer4.W).sum()
+    L2_sqrt = (layer0.W**2).sum()+(layer1.W**2).sum()+(layer2.W**2).sum()+(layer3.W**2).sum()+(layer4.W).sum()
+
+    cost = (
+        layer4.negative_log_likelihood(y)+5e-07*L1+1e-08*L2_sqrt
+    )
+
+    #
 
     # create a function to compute the mistakes that are made by the model
     test_model = theano.function(
@@ -250,6 +252,7 @@ def evaluate_lenet5(learning_rate=0.13, n_epochs=200,
         }
     )
 
+    """
     # create a list of all model parameters to be fit by gradient descent
     params = layer4.params + layer3.params + layer2.params + layer1.params+layer0.params
 
@@ -265,6 +268,24 @@ def evaluate_lenet5(learning_rate=0.13, n_epochs=200,
         (param_i, param_i - learning_rate * grad_i)
         for param_i, grad_i in zip(params, grads)
     ]
+    """
+
+    params = layer4.params + layer3.params + layer2.params + layer1.params+layer0.params
+
+    delta_before = []
+    for param_i in params:
+        delta_before_i = theano.shared(value=numpy.zeros(param_i.get_value().shape,dtype="float32"))
+        delta_before.append(delta_before_i)
+
+    updates = []
+    alpha = 0.01
+    # param_i = -learning_rate * grad_i + alpha*param_i_before
+    grads = T.grad(cost, params)
+
+    for param_i, grad_i, delta_before_i in zip(params, grads, delta_before):
+        delta_i = -learning_rate * grad_i + alpha * delta_before_i
+        updates.append((param_i, param_i + delta_i))
+        updates.append((delta_before_i, delta_i))
 
     train_model = theano.function(
         [index],
@@ -285,7 +306,7 @@ def evaluate_lenet5(learning_rate=0.13, n_epochs=200,
     patience = 10000  # look as this many examples regardless
     patience_increase = 2  # wait this much longer when a new best is
                            # found
-    improvement_threshold = 0.995  # a relative improvement of this much is
+    improvement_threshold = 0.9995  # a relative improvement of this much is
                                    # considered significant
     validation_frequency = min(n_train_batches, patience / 2)
                                   # go through this many
@@ -343,6 +364,12 @@ def evaluate_lenet5(learning_rate=0.13, n_epochs=200,
                            'best model %f %%') %
                           (epoch, minibatch_index + 1, n_train_batches,
                            test_score * 100.))
+                    with open("best_model.pkl","w") as f:
+                        cPickle.dump(layer0, f, protocol=cPickle.HIGHEST_PROTOCOL)
+                        cPickle.dump(layer1, f, protocol=cPickle.HIGHEST_PROTOCOL)
+                        cPickle.dump(layer2, f, protocol=cPickle.HIGHEST_PROTOCOL)
+                        cPickle.dump(layer3, f, protocol=cPickle.HIGHEST_PROTOCOL)
+                        cPickle.dump(layer4, f, protocol=cPickle.HIGHEST_PROTOCOL)
 
             if patience <= iter:
                 done_looping = True

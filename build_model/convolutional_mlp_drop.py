@@ -9,17 +9,17 @@ import theano.tensor as T
 from theano.tensor.signal import downsample
 from theano.tensor.nnet import conv
 
-from logistic_sgd import LogisticRegression
-from mlp import HiddenLayer, ReLu
+from logistic_sgd_drop import LogisticRegression
+from mlp_drop import HiddenLayer, ReLu, dropout
 
 def load_data(sequences, labels):
     print "loading data.............."
     sequence = np.load(sequences)#make sure the data type is float 32
     label = np.load(labels)
 
-    num_train = 720000
-    num_valid = 360000
-    num_test = 360881
+    num_train = 1000
+    num_valid = 500
+    num_test = 500
 
     train_sequence = sequence[0:num_train,]
     train_label = label[0:num_train]
@@ -51,7 +51,7 @@ def load_data(sequences, labels):
 class LeNetConvPoolLayer(object):
     """Pool Layer of a convolutional network """
 
-    def __init__(self, rng, input, filter_shape, image_shape, poolsize):
+    def __init__(self, rng, input, filter_shape, image_shape, poolsize, dropout_rate):
         """
         Allocate a LeNetConvPoolLayer with shared variable internal parameters.
 
@@ -117,7 +117,7 @@ class LeNetConvPoolLayer(object):
         # reshape it to a tensor of shape (1, n_filters, 1, 1). Each bias will
         # thus be broadcasted across mini-batches and feature map
         # width & height
-        self.output = ReLu(pooled_out + self.b.dimshuffle('x', 0, 'x', 'x'))
+        self.output = dropout(rng=rng, input=ReLu(pooled_out + self.b.dimshuffle('x', 0, 'x', 'x')), p_rate = dropout_rate)
 
         # store parameters of this layer
         self.params = [self.W, self.b]
@@ -126,9 +126,9 @@ class LeNetConvPoolLayer(object):
         self.input = input
 
 
-def evaluate_lenet5(learning_rate=0.13, n_epochs=200,
+def evaluate_lenet5(learning_rate=0.03, n_epochs=200,
                     sequence="sequence_shuffle_float32.npy", labels="label_shuffle_int64.npy",
-                    nkerns=[320, 480, 960], batch_size=1000):
+                    nkerns=[320, 480, 960], batch_size=100):
     """ Demonstrates lenet on MNIST dataset
 
     :type learning_rate: float
@@ -177,18 +177,16 @@ def evaluate_lenet5(learning_rate=0.13, n_epochs=200,
     # Reshape matrix of rasterized images of shape (batch_size, 28 * 28)
     # to a 4D tensor, compatible with our LeNetConvPoolLayer
     # (28, 28) is the size of MNIST images.
-    layer0_input = x.reshape((batch_size, 1, 600, 4))
+    layer0_input = dropout(rng, x.reshape((batch_size, 1, 600, 4)), p_rate=0.5)
 
     # Construct the first convolutional pooling layer:
-    # filtering reduces the image size to (28-5+1 , 28-5+1) = (24, 24)
-    # maxpooling reduces this further to (24/2, 24/2) = (12, 12)
-    # 4D output tensor is thus of shape (batch_size, nkerns[0], 12, 12)
     layer0 = LeNetConvPoolLayer(
         rng,
         input=layer0_input,
         image_shape=(batch_size, 1, 600, 4),
         filter_shape=(nkerns[0], 1, 19, 4),
-        poolsize=(3, 1)
+        poolsize=(3, 1),
+        dropout_rate = 0.5
     )
 
     layer1 = LeNetConvPoolLayer(
@@ -196,7 +194,8 @@ def evaluate_lenet5(learning_rate=0.13, n_epochs=200,
         input=layer0.output,
         image_shape=(batch_size, nkerns[0], 194, 1),
         filter_shape=(nkerns[1], nkerns[0], 11, 1),
-        poolsize=(4, 1)
+        poolsize=(4, 1),
+        dropout_rate = 0.5
     )
 
     layer2 = LeNetConvPoolLayer(
@@ -204,17 +203,9 @@ def evaluate_lenet5(learning_rate=0.13, n_epochs=200,
         input=layer1.output,
         image_shape=(batch_size, nkerns[1], 46, 1),
         filter_shape=(nkerns[2], nkerns[1], 7, 1),
-        poolsize=(4,1)
+        poolsize=(4,1),
+        dropout_rate = 0.5
     )
-    # Construct the second convolutional pooling layer
-    # filtering reduces the image size to (12-5+1, 12-5+1) = (8, 8)
-    # maxpooling reduces this further to (8/2, 8/2) = (4, 4)
-    # 4D output tensor is thus of shape (batch_size, nkerns[1], 4, 4)
-
-    # the HiddenLayer being fully-connected, it operates on 2D matrices of
-    # shape (batch_size, num_pixels) (i.e matrix of rasterized images).
-    # This will generate a matrix of shape (batch_size, nkerns[1] * 4 * 4),
-    # or (500, 50 * 4 * 4) = (500, 800) with the default values.
     layer3_input = layer2.output.flatten(2)
 
     # construct a fully-connected sigmoidal layer
@@ -223,13 +214,22 @@ def evaluate_lenet5(learning_rate=0.13, n_epochs=200,
         input=layer3_input,
         n_in=nkerns[2] * 10 * 1,
         n_out=1000,
+        dropout_rate = 0.5
     )
 
     # classify the values of the fully-connected sigmoidal layer
-    layer4 = LogisticRegression(input=layer3.output, n_in=1000, n_out=5)
+    layer4 = LogisticRegression(input=layer3.output, n_in=1000, n_out=5, dropout_rate=0.5)
 
     # the cost we minimize during training is the NLL of the model
-    cost = layer4.negative_log_likelihood(y)
+
+    L1 = abs(layer0.W).sum()+abs(layer1.W).sum()+abs(layer2.W).sum()+abs(layer3.W).sum()+abs(layer4.W).sum()
+    L2_sqrt = (layer0.W**2).sum()+(layer1.W**2).sum()+(layer2.W**2).sum()+(layer3.W**2).sum()+(layer4.W).sum()
+
+    cost = (
+        layer4.negative_log_likelihood(y)+5e-07*L1+1e-08*L2_sqrt
+    )
+
+    #
 
     # create a function to compute the mistakes that are made by the model
     test_model = theano.function(
